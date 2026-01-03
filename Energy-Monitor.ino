@@ -5,6 +5,11 @@
  *
  */
 
+// Watchdog relevant
+#include "esp_system.h"
+#include "rom/ets_sys.h"
+
+// Monitor relevant
 #include <config.h>
 #include <MD_Parola.h>
 #include <MD_MAX72xx.h>
@@ -37,6 +42,20 @@ String mqttPreis = "?";
 String mqttHausEnergyConsumption = "?";
 String mqttTibberEnergyConsumption = "?";
 String mqttHausPvDach = "?";
+
+// watchdog
+const int wdtTimeout = 30000;  // timeout in µs
+hw_timer_t* timer = NULL;
+
+// =========== Watchdog ==============
+
+/**
+ * Calles on watchdog alarm.
+ */
+void ARDUINO_ISR_ATTR resetModule() {
+  ets_printf("reboot\n");
+  esp_restart();
+}
 
 // =========== MQTT ==============
 
@@ -98,6 +117,12 @@ void mqtt_reconnect() {
 // =========== Setup ==============
 
 void setup() {
+
+  // Initialize Watchdog
+  timer = timerBegin(1000000);                     // timer 1Mhz resolution
+  timerAttachInterrupt(timer, &resetModule);       // attach callback
+  timerAlarm(timer, wdtTimeout * 1000, false, 0);  // set timeout as wdtTimeout (µs)
+
   delay(200);
   Serial.begin(115200);
   delay(500);
@@ -154,8 +179,15 @@ void setup() {
 
 
 void loop() {
+  timerWrite(timer, 0);  // feed watchdog
+  //esp_task_wdt_reset();
+
+  /*  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.reconnect();
+  }*/
+
   mqtt_reconnect();  //MQTT
- 
+
   for (int i = 0; i < MAX_DEVICES_NUMBER; i++) ledMatrix[i].displayClear();
   ledMatrix[0].print("Verbrauch");
   ledMatrix[1].print(mqttHausEnergyConsumption);
