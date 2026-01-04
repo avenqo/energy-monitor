@@ -9,7 +9,11 @@
 #include "esp_system.h"
 #include "rom/ets_sys.h"
 
+#include <map>
+#include <String.h>
+
 // Monitor relevant
+#include <data.h>
 #include <config.h>
 #include <MD_Parola.h>
 #include <MD_MAX72xx.h>
@@ -25,6 +29,8 @@
 #define CS_PIN_3 21  // Row 3
 #define CS_PIN_4 22  // Row 4
 
+#define LOOP_DURATION 5000
+
 const char* ssid = WIFI_SSID;
 const char* password = WIFI_PASSWORD;
 const char* mqtt_server = MQTT_SERVER;
@@ -37,11 +43,13 @@ MD_Parola ledMatrix[] = { MD_Parola(HARDWARE_TYPE, CS_PIN_1, MAX_DEVICES_NUMBER)
 WiFiClient espClient;
 PubSubClient mqtt_client(espClient);
 
-// MQTT Data
+/*
+// MQTT Data being updated by mqtt_callback()
 String mqttPreis = "?";
 String mqttHausEnergyConsumption = "?";
 String mqttTibberEnergyConsumption = "?";
 String mqttHausPvDach = "?";
+*/
 
 // watchdog
 const int wdtTimeout = 30000;  // timeout in µs
@@ -59,6 +67,36 @@ void ARDUINO_ISR_ATTR resetModule() {
 
 // =========== MQTT ==============
 
+// MQTT Message & Value
+std::map<String, String> mapMqttMessageValue;
+
+bool isEnclosedInBrackets(const char* str) {
+  if (str == NULL || strlen(str) < 2) {
+    return false;  // Zu kurz, um von Klammern eingeschlossen zu sein
+  }
+  return str[0] == '[' && str[strlen(str) - 1] == ']';
+}
+
+
+bool extractEnclosedValue(const char* input, char* output, size_t outputSize) {
+  size_t inputLength = strlen(input);
+  if (inputLength < 3) {  // Mindestens "[x]"
+    return false;
+  }
+
+  // Prüfe, ob der String mit '[' beginnt und mit ']' endet
+  if (input[0] != '[' || input[inputLength - 1] != ']') {
+    return false;
+  }
+
+  // Kopiere den Inhalt zwischen den Klammern in 'output'
+  strncpy(output, input + 1, inputLength - 2);
+  output[inputLength - 2] = '\0';  // Null-Terminierung
+
+  return true;
+}
+
+
 /**
  * Called when new mqtt message was received.
  *
@@ -74,13 +112,15 @@ void mqtt_callback(char* topic, byte* message, unsigned int length) {
     strValue += (char)message[i];
   }
   Serial.println("]");
+  mapMqttMessageValue[topic] = strValue;
 
-  if (strcmp(topic, "/home/tibber/price/current") == 0) {
+  /*
+  // --- Page 1 ---
+  if (strcmp(topic, "/home/tibber/price/current") == 0)
     mqttPreis = strValue;
-    Serial.println("FOUND");
-  }
+
   if (strcmp(topic, "/home/haus/energy/consumption") == 0)
-    mqttHausEnergyConsumption = strValue;
+    mqttHausEnergyConsumption = strValue;*/
 }
 
 /**
@@ -177,24 +217,92 @@ void setup() {
 
 // =========== Loop ==============
 
+String formatEuroToCent(String euroString) {
+  // 1. String in float umwandeln
+  float euroValue = euroString.toFloat();
+
+  // 2. In Cent umrechnen (mal 100)
+  float centValue = euroValue * 100.0f;
+
+  // 3. Auf eine Dezimalstelle runden
+  centValue = round(centValue * 10) / 10;
+
+  // 4. In einen String mit einer Dezimalstelle umwandeln
+  char buffer[10]; // Puffer für die formatierte Zahl
+  dtostrf(centValue, 4, 1, buffer); // 4 = Mindestbreite, 1 = Dezimalstellen
+
+  // 5. " Cent" anhängen und zurückgeben
+  return String(buffer) + " ct";
+}
+
+void displayPage(int indexPage) {
+  Serial.print("--- displayPage [");
+  Serial.print(indexPage);
+  Serial.println("] ---");
+
+  for (int rowIndex = 0; rowIndex < ROW_NUM; rowIndex++) {
+    const char* text = page_data[indexPage][rowIndex][0];
+    const char* dynamicMode = page_data[indexPage][rowIndex][1];
+    Serial.print(text);
+    Serial.print(" | ");
+    Serial.println(dynamicMode);
+
+
+    char mqttTopic[150];  // MQTT topics are enclodes in [...]
+
+    if (isEnclosedInBrackets(text)) {
+      // Yes, there exists an mqtt topic
+      if (extractEnclosedValue(text, mqttTopic, sizeof(mqttTopic))) {
+        Serial.print("Extracted MQTT topic ");
+        Serial.println(mqttTopic);
+
+        // get value of topic
+        if (mapMqttMessageValue.find(mqttTopic) != mapMqttMessageValue.end()) {
+
+          String value = mapMqttMessageValue[mqttTopic];
+
+          // some values must get some additional informations
+          if (strstr(mqttTopic, "/home/victron/mp/soc") != NULL) {
+            value = value + "%";
+          } else if (strstr(mqttTopic, "/home/tibber/price/current") != NULL) {
+            value = formatEuroToCent(value);
+          } 
+
+          ledMatrix[rowIndex].print(value);
+        } else
+          ledMatrix[rowIndex].print("???");
+      }
+    } else {
+      // Serial.println("Der String ist nicht von Klammern eingeschlossen.");
+      ledMatrix[rowIndex].print(text);
+    }
+  }
+}
+
+unsigned long lastPageChange = 0;
+uint8_t currentPageIndex = PAGE_NUM - 1;
 
 void loop() {
   timerWrite(timer, 0);  // feed watchdog
-  //esp_task_wdt_reset();
+  mqtt_reconnect();      //MQTT
+  mqtt_client.loop();
 
-  /*  if (WiFi.status() != WL_CONNECTED) {
-    WiFi.reconnect();
-  }*/
+  delay(50);  // safe processow power
 
-  mqtt_reconnect();  //MQTT
-
+  // --- Display ---
+  // if (millis() - lastPageChange > 10000) { // Alle 10 Sekunden wechseln
+  if (millis() - lastPageChange > LOOP_DURATION) {  // Alle 10 Sekunden wechseln
+    lastPageChange = millis();
+    currentPageIndex = (currentPageIndex + 1) % PAGE_NUM;
+    displayPage(currentPageIndex);
+  }
+  /*
   for (int i = 0; i < MAX_DEVICES_NUMBER; i++) ledMatrix[i].displayClear();
   ledMatrix[0].print("Verbrauch");
   ledMatrix[1].print(mqttHausEnergyConsumption);
   ledMatrix[2].print("Preis");
   ledMatrix[3].print(mqttPreis);
-
-  // updateTime();
-  delay(1000);
-  mqtt_client.loop();
+*/
+  // delay(1000);
+  // mqtt_client.loop();
 }
